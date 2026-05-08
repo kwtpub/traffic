@@ -1,15 +1,10 @@
 #!/bin/bash
-# install.sh — автоматическая установка traffic_noise (адаптивная версия)
-# как systemd-сервиса. Скачивает в RATIO раз больше байт, чем сервер
-# отдает наружу (TX), чтобы соотношение RX:TX выглядело как у обычного
-# клиента, а не как у proxy/VPN сервера.
-#
-# Установщик встраивает актуальную версию traffic_noise.sh в свое тело.
-# Если правишь логику — синхронизируй блок между NOISE_EOF метками
-# с traffic_noise.sh из этого же репозитория.
+# install.sh — автоматическая установка traffic_noise (непрерывный режим)
+# как systemd-сервиса. Скачивает в RATIO раз быстрее, чем сервер отдает (TX),
+# подстраивая скорость в реальном времени без окон и порогов.
 #
 # Использование на сервере (Debian/Ubuntu, от root):
-#   curl -fsSL https://<твой-raw-url> | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/strelkatech/traffic-noise/main/install.sh | sudo bash
 
 set -euo pipefail
 
@@ -29,32 +24,28 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/6] Устанавливаю зависимости..."
+echo "[1/5] Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates gawk iproute2 vnstat >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true
 
-echo "[2/6] Записываю traffic_noise.sh в $SCRIPT_PATH..."
+echo "[2/5] Записываю traffic_noise.sh в $SCRIPT_PATH..."
 cat > "$SCRIPT_PATH" <<'NOISE_EOF'
 #!/bin/bash
-# Адаптивный шум: RX = RATIO * TX за окно WINDOW секунд.
+# Непрерывный адаптивный шум: RX_rate = RATIO * TX_rate, обновление 1 раз/сек.
 
 set -u
 
-IFACE="${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
 RATIO="${RATIO:-2.5}"
-WINDOW="${WINDOW:-60}"
-MAX_DOWNLOAD_MB="${MAX_DOWNLOAD_MB:-500}"
-MIN_TX_BYTES="${MIN_TX_BYTES:-1048576}"
-LIMIT_RATE="${LIMIT_RATE:-0}"
+IFACE="${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
 
 FILES=(
-  "https://speed.hetzner.de/100MB.bin"
+  "https://speed.hetzner.de/10GB.bin"
   "https://speed.hetzner.de/1GB.bin"
-  "http://speedtest.tele2.net/100MB.zip"
+  "http://speedtest.tele2.net/10GB.zip"
   "http://speedtest.tele2.net/1GB.zip"
-  "https://proof.ovh.net/files/100Mb.dat"
+  "https://proof.ovh.net/files/10Gb.dat"
   "https://proof.ovh.net/files/1Gb.dat"
   "https://releases.ubuntu.com/jammy/ubuntu-22.04.4-live-server-amd64.iso"
   "https://cdimage.debian.org/debian-cd/current/amd64/iso-cd/debian-12.5.0-amd64-netinst.iso"
@@ -66,89 +57,54 @@ if [[ -z "$IFACE" ]]; then
 fi
 
 TX_FILE="/sys/class/net/$IFACE/statistics/tx_bytes"
-RX_FILE="/sys/class/net/$IFACE/statistics/rx_bytes"
-
 if [[ ! -r "$TX_FILE" ]]; then
-  echo "Нет доступа к $TX_FILE (интерфейс $IFACE существует?)" >&2
+  echo "Нет доступа к $TX_FILE" >&2
   exit 1
 fi
 
-echo "Старт. Интерфейс=$IFACE RATIO=$RATIO Окно=${WINDOW}s Потолок=${MAX_DOWNLOAD_MB}MB"
+cleanup() { exit 0; }
+trap cleanup SIGINT SIGTERM EXIT
 
-cleanup() { echo "Остановка."; exit 0; }
-trap cleanup SIGINT SIGTERM
+echo "Старт. Интерфейс=$IFACE RATIO=$RATIO (непрерывный режим)"
+
+TX_PREV=$(<"$TX_FILE")
+T_PREV=$(date +%s.%N)
 
 while true; do
-  TX_START=$(<"$TX_FILE")
-  sleep "$WINDOW"
-  TX_END=$(<"$TX_FILE")
+  sleep 1
 
-  TX_DELTA=$(( TX_END - TX_START ))
-  (( TX_DELTA < 0 )) && TX_DELTA=0
+  TX_NOW=$(<"$TX_FILE")
+  T_NOW=$(date +%s.%N)
 
-  TARGET_BYTES=$(awk -v d="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", d*r}')
-  MAX_BYTES=$(( MAX_DOWNLOAD_MB * 1024 * 1024 ))
-  (( TARGET_BYTES > MAX_BYTES )) && TARGET_BYTES=$MAX_BYTES
+  TX_RATE_BPS=$(awk -v a="$TX_PREV" -v b="$TX_NOW" -v t1="$T_PREV" -v t2="$T_NOW" \
+    'BEGIN{dt=t2-t1; if(dt<=0)dt=1; d=b-a; if(d<0)d=0; printf "%.0f", d/dt}')
 
-  TS=$(date '+%F %H:%M:%S')
-  TX_MB=$(awk -v b="$TX_DELTA"  'BEGIN{printf "%.2f", b/1048576}')
-  TGT_MB=$(awk -v b="$TARGET_BYTES" 'BEGIN{printf "%.2f", b/1048576}')
+  TX_PREV="$TX_NOW"
+  T_PREV="$T_NOW"
 
-  if (( TX_DELTA < MIN_TX_BYTES )); then
-    echo "[$TS] TX=${TX_MB}MB — idle, пропуск"
-    continue
-  fi
+  TARGET_KBPS=$(awk -v r="$TX_RATE_BPS" -v k="$RATIO" 'BEGIN{v=(r*k)/1024; if(v<1)v=1; printf "%.0f", v}')
 
-  echo "[$TS] TX=${TX_MB}MB → качаю ${TGT_MB}MB"
+  URL=${FILES[$RANDOM % ${#FILES[@]}]}
+  HOST=$(echo "$URL" | awk -F/ '{print $3}')
 
-  DOWNLOADED=0
-  while (( DOWNLOADED < TARGET_BYTES )); do
-    URL=${FILES[$RANDOM % ${#FILES[@]}]}
-    REMAIN=$(( TARGET_BYTES - DOWNLOADED ))
+  TX_MB=$(awk -v r="$TX_RATE_BPS" 'BEGIN{printf "%.2f", r/1048576}')
+  TGT_MB=$(awk -v k="$TARGET_KBPS" 'BEGIN{printf "%.2f", k/1024}')
+  echo "[$(date '+%H:%M:%S')] TX=${TX_MB}MB/s → RX=${TGT_MB}MB/s ← $HOST"
 
-    CURL_ARGS=(-s -o /dev/null
-      --max-time 120
-      --user-agent "Mozilla/5.0 (X11; Linux x86_64)"
-      -r "0-$((REMAIN - 1))")
-    if [[ "$LIMIT_RATE" != "0" ]]; then
-      CURL_ARGS+=(--limit-rate "$LIMIT_RATE")
-    fi
-
-    BEFORE=$(<"$RX_FILE")
-    curl "${CURL_ARGS[@]}" "$URL" || true
-    AFTER=$(<"$RX_FILE")
-
-    GOT=$(( AFTER - BEFORE ))
-    (( GOT <= 0 )) && GOT=$REMAIN
-    DOWNLOADED=$(( DOWNLOADED + GOT ))
-
-    GOT_MB=$(awk -v b="$GOT" 'BEGIN{printf "%.2f", b/1048576}')
-    echo "[$(date '+%H:%M:%S')]   +${GOT_MB}MB ← $URL"
-  done
-
-  DONE_MB=$(awk -v b="$DOWNLOADED" 'BEGIN{printf "%.2f", b/1048576}')
-  echo "[$(date '+%F %H:%M:%S')] Окно: скачано ${DONE_MB}MB"
+  curl -s --max-time 30 \
+    --user-agent "Mozilla/5.0 (X11; Linux x86_64)" \
+    --limit-rate "${TARGET_KBPS}k" \
+    -r "0-5242879" \
+    -o /dev/null \
+    "$URL" || true
 done
 NOISE_EOF
 chmod +x "$SCRIPT_PATH"
 
-echo "[3/6] Создаю файл настроек $ENV_PATH..."
-if [[ ! -f "$ENV_PATH" ]]; then
-  cat > "$ENV_PATH" <<ENV_EOF
-# Конфигурация traffic-noise. После правки: systemctl restart $SERVICE_NAME
-#IFACE=eth0
-RATIO=2.5
-WINDOW=60
-MAX_DOWNLOAD_MB=500
-MIN_TX_BYTES=1048576
-LIMIT_RATE=0
-ENV_EOF
-fi
-
-echo "[4/6] Создаю systemd unit $SERVICE_PATH..."
+echo "[3/5] Создаю systemd unit $SERVICE_PATH..."
 cat > "$SERVICE_PATH" <<UNIT_EOF
 [Unit]
-Description=Adaptive Traffic Noise (RX = RATIO * TX)
+Description=Adaptive Traffic Noise (continuous, RX_rate = RATIO * TX_rate)
 After=network-online.target
 Wants=network-online.target
 
@@ -166,22 +122,30 @@ StandardError=append:$LOG_PATH
 WantedBy=multi-user.target
 UNIT_EOF
 
+if [[ ! -f "$ENV_PATH" ]]; then
+  cat > "$ENV_PATH" <<ENV_EOF
+# Конфигурация traffic-noise (опционально). После правки: systemctl restart $SERVICE_NAME
+#IFACE=eth0
+#RATIO=2.5
+ENV_EOF
+fi
+
 touch "$LOG_PATH"
 chmod 644 "$LOG_PATH"
 
-echo "[5/6] Перезагружаю systemd, включаю автозапуск..."
+echo "[4/5] Перезагружаю systemd, включаю автозапуск..."
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
-echo "[6/6] Запускаю сервис..."
+echo "[5/5] Запускаю сервис..."
 systemctl restart "$SERVICE_NAME"
 
 sleep 1
 systemctl status "$SERVICE_NAME" --no-pager -l || true
 
 echo
-echo "Готово. Конфиг: $ENV_PATH"
+echo "Готово."
 echo "Логи:     tail -f $LOG_PATH"
 echo "Журнал:   journalctl -u $SERVICE_NAME -f"
-echo "Трафик:   vnstat -l    (live)   |   vnstat -h    (по часам)"
+echo "Трафик:   vnstat -l    (live)   |   vnstat -d    (по дням, проверить RX:TX)"
 echo "Стоп:     systemctl stop $SERVICE_NAME"
