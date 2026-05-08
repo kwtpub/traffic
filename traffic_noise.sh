@@ -9,6 +9,7 @@ IFACE="${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if
 MIN_WORKERS="${MIN_WORKERS:-0}"
 MAX_WORKERS="${MAX_WORKERS:-32}"
 CHUNK_MB="${CHUNK_MB:-200}"
+VERBOSE="${VERBOSE:-0}"        # 1 = строка каждые 2 сек, 0 = сводка раз в 60 сек
 
 FILES=(
   "https://speed.hetzner.de/10GB.bin"
@@ -39,7 +40,6 @@ CHUNK_BYTES=$(( CHUNK_MB * 1024 * 1024 ))
 END_OFFSET=$(( CHUNK_BYTES - 1 ))
 
 cleanup() {
-  echo "Остановка, убиваю воркеров..."
   for pidfile in "$WORKER_DIR"/*.pid; do
     [[ -f "$pidfile" ]] || continue
     kill "$(<"$pidfile")" 2>/dev/null || true
@@ -49,12 +49,9 @@ cleanup() {
 }
 trap cleanup SIGINT SIGTERM EXIT
 
-# Один воркер: бесконечный цикл curl со случайным зеркалом.
-# Запускается в фоне, PID пишется в pidfile, по завершении удаляет себя.
 spawn_worker() {
   local id=$1
   local pidfile="$WORKER_DIR/$id.pid"
-
   (
     while true; do
       local url=${FILES[$RANDOM % ${#FILES[@]}]}
@@ -91,9 +88,8 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. Интерфейс=$IFACE RATIO=$RATIO MIN=$MIN_WORKERS MAX=$MAX_WORKERS CHUNK=${CHUNK_MB}MB"
+echo "Старт. Интерфейс=$IFACE RATIO=$RATIO MIN=$MIN_WORKERS MAX=$MAX_WORKERS CHUNK=${CHUNK_MB}MB VERBOSE=$VERBOSE"
 
-# Стартовое количество воркеров
 NEXT_ID=0
 for ((i=0; i<MIN_WORKERS; i++)); do
   spawn_worker "$NEXT_ID"
@@ -103,6 +99,10 @@ done
 TX_PREV=$(<"$TX_FILE")
 RX_PREV=$(<"$RX_FILE")
 T_PREV=$(date +%s.%N)
+
+# Агрегаты для краткой сводки (используются при VERBOSE=0)
+SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+LAST_SUMMARY=$(date +%s)
 
 while true; do
   sleep 2
@@ -127,8 +127,6 @@ while true; do
   TARGET_RX=$(awk -v r="$TX_RATE" -v k="$RATIO" 'BEGIN{printf "%.0f", r*k}')
   N=$(count_workers)
 
-  # Решение: добавлять/убирать воркеров.
-  # Деадзона ±10% чтобы не дрожать.
   LOW=$(awk -v t="$TARGET_RX"  'BEGIN{printf "%.0f", t*0.90}')
   HIGH=$(awk -v t="$TARGET_RX" 'BEGIN{printf "%.0f", t*1.10}')
 
@@ -146,9 +144,34 @@ while true; do
     done
   fi
 
-  TX_MBIT=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-  RX_MBIT=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-  TGT_MBIT=$(awk -v r="$TARGET_RX" 'BEGIN{printf "%.1f", r*8/1000000}')
+  if [[ "$VERBOSE" == "1" ]]; then
+    TX_MBIT=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    RX_MBIT=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    TGT_MBIT=$(awk -v r="$TARGET_RX" 'BEGIN{printf "%.1f", r*8/1000000}')
+    echo "[$(date '+%H:%M:%S')] TX=${TX_MBIT}Mbit/s RX=${RX_MBIT}Mbit/s (target=${TGT_MBIT}) workers=$N ${ACTION}"
+  else
+    SUM_TX=$(( SUM_TX + TX_RATE ))
+    SUM_RX=$(( SUM_RX + RX_RATE ))
+    SUM_TGT=$(( SUM_TGT + TARGET_RX ))
+    SUM_N=$(( SUM_N + N ))
+    TICKS=$(( TICKS + 1 ))
 
-  echo "[$(date '+%H:%M:%S')] TX=${TX_MBIT}Mbit/s RX=${RX_MBIT}Mbit/s (target=${TGT_MBIT}) workers=$N ${ACTION}"
+    NOW=$(date +%s)
+    if (( NOW - LAST_SUMMARY >= 60 )); then
+      AVG_TX=$(( SUM_TX / TICKS ))
+      AVG_RX=$(( SUM_RX / TICKS ))
+      AVG_TGT=$(( SUM_TGT / TICKS ))
+      AVG_N=$(awk -v s="$SUM_N" -v t="$TICKS" 'BEGIN{printf "%.1f", s/t}')
+
+      TX_MBIT=$(awk -v r="$AVG_TX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      RX_MBIT=$(awk -v r="$AVG_RX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      TGT_MBIT=$(awk -v r="$AVG_TGT" 'BEGIN{printf "%.1f", r*8/1000000}')
+      RATIO_NOW=$(awk -v t="$AVG_TX" -v r="$AVG_RX" 'BEGIN{if(t<1) t=1; printf "%.2f", r/t}')
+
+      echo "[$(date '+%F %H:%M:%S')] avg/min: TX=${TX_MBIT} RX=${RX_MBIT} target=${TGT_MBIT} Mbit/s | ratio=${RATIO_NOW} | workers~${AVG_N}"
+
+      SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+      LAST_SUMMARY=$NOW
+    fi
+  fi
 done

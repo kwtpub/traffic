@@ -4,7 +4,7 @@
 # RX_rate = RATIO * TX_rate.
 #
 # Использование на сервере (Debian/Ubuntu, от root):
-#   curl -fsSL https://raw.githubusercontent.com/kwtpub/traffic/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/strelkatech/traffic-noise/main/install.sh | sudo bash
 
 set -euo pipefail
 
@@ -12,6 +12,7 @@ SCRIPT_PATH="/usr/local/bin/traffic_noise.sh"
 SERVICE_PATH="/etc/systemd/system/traffic-noise.service"
 ENV_PATH="/etc/default/traffic-noise"
 LOG_PATH="/var/log/traffic_noise.log"
+LOGROTATE_PATH="/etc/logrotate.d/traffic-noise"
 SERVICE_NAME="traffic-noise"
 
 if [[ $EUID -ne 0 ]]; then
@@ -24,17 +25,18 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/5] Устанавливаю зависимости..."
+echo "[1/6] Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates gawk iproute2 procps vnstat >/dev/null
+apt-get install -y -qq curl ca-certificates gawk iproute2 procps vnstat logrotate >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true
 
-echo "[2/5] Записываю traffic_noise.sh в $SCRIPT_PATH..."
+echo "[2/6] Записываю traffic_noise.sh в $SCRIPT_PATH..."
 cat > "$SCRIPT_PATH" <<'NOISE_EOF'
 #!/bin/bash
 # Параллельный пул curl: RX_rate = RATIO * TX_rate за счет регулирования
 # числа активных воркеров. Замеры/решения каждые 2 секунды.
+# По умолчанию пишет в лог сводку раз в минуту (VERBOSE=1 — каждые 2 сек).
 
 set -u
 
@@ -43,6 +45,7 @@ IFACE="${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if
 MIN_WORKERS="${MIN_WORKERS:-0}"
 MAX_WORKERS="${MAX_WORKERS:-32}"
 CHUNK_MB="${CHUNK_MB:-200}"
+VERBOSE="${VERBOSE:-0}"
 
 FILES=(
   "https://speed.hetzner.de/10GB.bin"
@@ -121,7 +124,7 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. Интерфейс=$IFACE RATIO=$RATIO MIN=$MIN_WORKERS MAX=$MAX_WORKERS CHUNK=${CHUNK_MB}MB"
+echo "Старт. Интерфейс=$IFACE RATIO=$RATIO MIN=$MIN_WORKERS MAX=$MAX_WORKERS CHUNK=${CHUNK_MB}MB VERBOSE=$VERBOSE"
 
 NEXT_ID=0
 for ((i=0; i<MIN_WORKERS; i++)); do
@@ -132,6 +135,9 @@ done
 TX_PREV=$(<"$TX_FILE")
 RX_PREV=$(<"$RX_FILE")
 T_PREV=$(date +%s.%N)
+
+SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+LAST_SUMMARY=$(date +%s)
 
 while true; do
   sleep 2
@@ -173,16 +179,41 @@ while true; do
     done
   fi
 
-  TX_MBIT=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-  RX_MBIT=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-  TGT_MBIT=$(awk -v r="$TARGET_RX" 'BEGIN{printf "%.1f", r*8/1000000}')
+  if [[ "$VERBOSE" == "1" ]]; then
+    TX_MBIT=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    RX_MBIT=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    TGT_MBIT=$(awk -v r="$TARGET_RX" 'BEGIN{printf "%.1f", r*8/1000000}')
+    echo "[$(date '+%H:%M:%S')] TX=${TX_MBIT}Mbit/s RX=${RX_MBIT}Mbit/s (target=${TGT_MBIT}) workers=$N ${ACTION}"
+  else
+    SUM_TX=$(( SUM_TX + TX_RATE ))
+    SUM_RX=$(( SUM_RX + RX_RATE ))
+    SUM_TGT=$(( SUM_TGT + TARGET_RX ))
+    SUM_N=$(( SUM_N + N ))
+    TICKS=$(( TICKS + 1 ))
 
-  echo "[$(date '+%H:%M:%S')] TX=${TX_MBIT}Mbit/s RX=${RX_MBIT}Mbit/s (target=${TGT_MBIT}) workers=$N ${ACTION}"
+    NOW=$(date +%s)
+    if (( NOW - LAST_SUMMARY >= 60 )); then
+      AVG_TX=$(( SUM_TX / TICKS ))
+      AVG_RX=$(( SUM_RX / TICKS ))
+      AVG_TGT=$(( SUM_TGT / TICKS ))
+      AVG_N=$(awk -v s="$SUM_N" -v t="$TICKS" 'BEGIN{printf "%.1f", s/t}')
+
+      TX_MBIT=$(awk -v r="$AVG_TX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      RX_MBIT=$(awk -v r="$AVG_RX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      TGT_MBIT=$(awk -v r="$AVG_TGT" 'BEGIN{printf "%.1f", r*8/1000000}')
+      RATIO_NOW=$(awk -v t="$AVG_TX" -v r="$AVG_RX" 'BEGIN{if(t<1) t=1; printf "%.2f", r/t}')
+
+      echo "[$(date '+%F %H:%M:%S')] avg/min: TX=${TX_MBIT} RX=${RX_MBIT} target=${TGT_MBIT} Mbit/s | ratio=${RATIO_NOW} | workers~${AVG_N}"
+
+      SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+      LAST_SUMMARY=$NOW
+    fi
+  fi
 done
 NOISE_EOF
 chmod +x "$SCRIPT_PATH"
 
-echo "[3/5] Создаю systemd unit $SERVICE_PATH..."
+echo "[3/6] Создаю systemd unit $SERVICE_PATH..."
 cat > "$SERVICE_PATH" <<UNIT_EOF
 [Unit]
 Description=Adaptive Traffic Noise (parallel curl pool)
@@ -212,17 +243,33 @@ if [[ ! -f "$ENV_PATH" ]]; then
 #MIN_WORKERS=0
 #MAX_WORKERS=32
 #CHUNK_MB=200
+#VERBOSE=0
 ENV_EOF
 fi
+
+echo "[4/6] Создаю logrotate-конфиг $LOGROTATE_PATH..."
+cat > "$LOGROTATE_PATH" <<LR_EOF
+$LOG_PATH {
+    daily
+    rotate 7
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+LR_EOF
+chmod 644 "$LOGROTATE_PATH"
 
 touch "$LOG_PATH"
 chmod 644 "$LOG_PATH"
 
-echo "[4/5] Перезагружаю systemd, включаю автозапуск..."
+echo "[5/6] Перезагружаю systemd, включаю автозапуск..."
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
 
-echo "[5/5] Запускаю сервис..."
+echo "[6/6] Запускаю сервис..."
 systemctl restart "$SERVICE_NAME"
 
 sleep 1
@@ -230,7 +277,8 @@ systemctl status "$SERVICE_NAME" --no-pager -l || true
 
 echo
 echo "Готово."
-echo "Логи:     tail -f $LOG_PATH"
+echo "Логи:     tail -f $LOG_PATH                  (тихий режим: 1 строка/мин)"
+echo "Подробно: VERBOSE=1 в $ENV_PATH              (1 строка/2 сек)"
 echo "Журнал:   journalctl -u $SERVICE_NAME -f"
-echo "Трафик:   vnstat -l    (live)   |   vnstat -h    (по часам, проверить RX:TX)"
+echo "Трафик:   vnstat -h                          (по часам, проверить RX:TX)"
 echo "Стоп:     systemctl stop $SERVICE_NAME"
