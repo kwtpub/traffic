@@ -4,7 +4,7 @@
 # RX_rate = RATIO * TX_rate.
 #
 # Использование на сервере (Debian/Ubuntu, от root):
-#   curl -fsSL https://raw.githubusercontent.com/strelkatech/traffic-noise/main/install.sh | sudo bash
+#   curl -fsSL https://raw.githubusercontent.com/kwtpub/traffic/main/install.sh | sudo bash
 
 set -euo pipefail
 
