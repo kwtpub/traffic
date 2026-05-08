@@ -1,31 +1,22 @@
 # traffic-noise
+---
 
-Адаптивный генератор шумового трафика для маскировки proxy/VPN-сервера.
+## Быстрый старт
 
-Раз в `WINDOW` секунд читает счетчики `/sys/class/net/<iface>/statistics/tx_bytes`,
-вычисляет дельту исходящего трафика и скачивает с публичных файловых зеркал
-в `RATIO` раз больше байт. В результате соотношение RX:TX становится
-характерным для обычного клиента (~2.5:1), а не для proxy-сервера (где TX > RX).
-
-## Содержимое
-
-- `traffic_noise.sh` — сам сервисный скрипт (бесконечный цикл замер → скачивание).
-- `install.sh` — установщик: ставит зависимости, кладет скрипт в `/usr/local/bin/`,
-  создает systemd unit и `EnvironmentFile`, запускает сервис.
-- `README.md` — этот файл.
-
-> `install.sh` встраивает копию `traffic_noise.sh` в свое тело между метками
-> `NOISE_EOF`. При правке логики синхронизируй оба файла.
-
-## Установка
-
-**Один раз на сервере (Debian/Ubuntu, нужен root):**
+Установка одной командой на Debian/Ubuntu (требуется root):
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/install.sh | sudo bash
 ```
 
-После установки сервис уже запущен и добавлен в автозагрузку.
+После установки сервис уже запущен и добавлен в автозагрузку. Проверка:
+
+```bash
+sudo systemctl status traffic-noise
+tail -f /var/log/traffic_noise.log
+```
+
+---
 
 ## Конфигурация
 
@@ -36,32 +27,46 @@ sudo systemctl restart traffic-noise
 ```
 
 | Переменная | По умолчанию | Назначение |
-|---|---|---|
-| `IFACE` | автоопределение | Сетевой интерфейс (например, `eth0`, `ens3`) |
-| `RATIO` | `2.5` | Во сколько раз RX должен превышать TX |
-| `WINDOW` | `60` | Окно замера в секундах |
-| `MAX_DOWNLOAD_MB` | `500` | Потолок скачивания за одно окно (страховка от лимитов VPS) |
-| `MIN_TX_BYTES` | `1048576` | Если за окно отдано меньше — считаем idle, не качаем |
-| `LIMIT_RATE` | `0` | `0` = без лимита; иначе передается в `curl --limit-rate` (например, `5M`) |
+|---|---:|---|
+| `IFACE` | автоопределение | Сетевой интерфейс. Если автоопределение ошибочно — задай вручную (`eth0`, `ens3`, `enp1s0`) |
+| `RATIO` | `2.5` | Целевое соотношение `RX:TX`. Для маскировки под мобильного клиента можно поднять до `3.5–4` |
+| `WINDOW` | `60` | Окно замера в секундах. Меньше окно — быстрее реакция, но чаще запросы |
+| `MAX_DOWNLOAD_MB` | `500` | Потолок скачивания за одно окно. Защита от runaway-нагрузки и лимитов VPS |
+| `MIN_TX_BYTES` | `1048576` | Порог idle (в байтах). Ниже — окно пропускается |
+| `LIMIT_RATE` | `0` | Лимит скорости curl. `0` = без лимита; `5M` = не быстрее 5 МБ/с — полезно, чтобы не забивать канал клиентов |
+
+---
 
 ## Управление
 
 ```bash
-sudo systemctl status traffic-noise           # состояние
-sudo systemctl restart traffic-noise          # перезапустить
-sudo systemctl stop traffic-noise             # остановить
-sudo systemctl disable traffic-noise          # убрать из автозапуска
+# Состояние
+sudo systemctl status traffic-noise
+sudo journalctl -u traffic-noise -f
 
-tail -f /var/log/traffic_noise.log            # логи скрипта
-sudo journalctl -u traffic-noise -f           # systemd-журнал
+# Логи скрипта
+tail -f /var/log/traffic_noise.log
 
-vnstat -l                                      # live-скорость
-vnstat -h                                      # трафик по часам
-vnstat -d                                      # трафик по дням (проверить RX:TX)
+# Перезапуск / остановка
+sudo systemctl restart traffic-noise
+sudo systemctl stop traffic-noise
+sudo systemctl disable traffic-noise   # убрать из автозагрузки
 ```
 
-Главная метрика — колонки `rx` / `tx` в `vnstat -d`. После суток работы
-`rx` должен быть примерно в `RATIO` раз больше `tx`.
+### Проверка результата
+
+Главная метрика — соотношение `rx`/`tx` в выводе `vnstat`:
+
+```bash
+vnstat -d        # по дням
+vnstat -h        # по часам
+vnstat -l        # live-скорость
+```
+
+После суток работы колонка `rx` должна быть в `RATIO` раз больше `tx`. Если соотношение не дотягивает — подними `MAX_DOWNLOAD_MB` или проверь логи (возможно, какие-то зеркала недоступны).
+
+---
+
 
 ## Удаление
 
@@ -73,18 +78,3 @@ sudo rm /etc/default/traffic-noise
 sudo rm /var/log/traffic_noise.log
 sudo systemctl daemon-reload
 ```
-
-## Требования
-
-- Debian/Ubuntu с systemd
-- Root-доступ для установки
-- Исходящий доступ в интернет (HTTP/HTTPS)
-- Зависимости (ставятся автоматически): `curl`, `ca-certificates`, `gawk`, `iproute2`, `vnstat`
-
-## Источники файлов для скачивания
-
-Список зеркал в `traffic_noise.sh` → массив `FILES`. Сейчас используются
-публичные speedtest-серверы (Hetzner, Tele2, OVH) и зеркала ISO-образов
-(Ubuntu, Debian). При необходимости замени на свои — главное, чтобы
-поддерживался HTTP Range (`-r 0-N`), иначе скрипт не сможет качать
-дозированными порциями.
