@@ -6,7 +6,7 @@
 Установка одной командой на Debian/Ubuntu (требуется root):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<org>/<repo>/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/strelkatech/traffic-noise/main/install.sh | sudo bash
 ```
 
 После установки сервис уже запущен и добавлен в автозагрузку. Проверка:
