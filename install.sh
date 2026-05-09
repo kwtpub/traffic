@@ -47,6 +47,7 @@ MAX_WORKERS="${MAX_WORKERS:-32}"
 CHUNK_MB="${CHUNK_MB:-200}"
 SMOOTH_WINDOW="${SMOOTH_WINDOW:-300}"
 BASE_MBIT="${BASE_MBIT:-10}"
+MAX_NOISE_MBIT="${MAX_NOISE_MBIT:-400}"
 JITTER="${JITTER:-0.30}"
 VERBOSE="${VERBOSE:-0}"
 
@@ -129,7 +130,7 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s jitter=$JITTER"
+echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s max_noise=${MAX_NOISE_MBIT}Mbit/s jitter=$JITTER"
 
 NEXT_ID=0
 for ((i=0; i<MIN_WORKERS; i++)); do
@@ -138,6 +139,7 @@ done
 
 DEBT=0
 BASE_BPS=$(awk -v m="$BASE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')
+MAX_NOISE_BPS=$(awk -v m="$MAX_NOISE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')
 TARGET_RATE_BPS=$BASE_BPS
 EMA_ALPHA="0.05"
 
@@ -171,12 +173,21 @@ while true; do
   TX_RATE=$(awk -v d="$TX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
   RX_RATE=$(awk -v d="$RX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
 
-  ADD_DEBT=$(awk -v tx="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", tx*r}')
+  RAW_ADD=$(awk -v tx="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", tx*r}')
+  CAP_ADD=$(awk -v tx="$TX_DELTA" -v cap="$MAX_NOISE_BPS" -v dt="$DT" \
+    'BEGIN{printf "%.0f", tx + cap*dt}')
+  if (( RAW_ADD > CAP_ADD )); then
+    ADD_DEBT=$CAP_ADD
+  else
+    ADD_DEBT=$RAW_ADD
+  fi
   DEBT=$(( DEBT + ADD_DEBT - RX_DELTA ))
   (( DEBT < 0 )) && DEBT=0
 
   WANT_BPS=$(awk -v d="$DEBT" -v w="$SMOOTH_WINDOW" -v b="$BASE_BPS" \
     'BEGIN{printf "%.0f", d/w + b}')
+  HARD_CAP=$(( TX_RATE + MAX_NOISE_BPS ))
+  (( WANT_BPS > HARD_CAP )) && WANT_BPS=$HARD_CAP
 
   TARGET_RATE_BPS=$(awk -v cur="$TARGET_RATE_BPS" -v want="$WANT_BPS" -v a="$EMA_ALPHA" \
     'BEGIN{printf "%.0f", cur + a*(want-cur)}')
@@ -271,6 +282,7 @@ if [[ ! -f "$ENV_PATH" ]]; then
 #CHUNK_MB=200
 #SMOOTH_WINDOW=300       # окно сглаживания, сек (300 = долг гасится за 5 минут)
 #BASE_MBIT=10            # базовый шум при idle, Mbit/s
+#MAX_NOISE_MBIT=400      # потолок прибавки RX над TX (RX <= TX + MAX_NOISE_MBIT)
 #JITTER=0.30             # рандом-разброс ±30%
 #VERBOSE=0
 ENV_EOF

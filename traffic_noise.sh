@@ -13,6 +13,7 @@ MAX_WORKERS="${MAX_WORKERS:-32}"
 CHUNK_MB="${CHUNK_MB:-200}"
 SMOOTH_WINDOW="${SMOOTH_WINDOW:-300}"   # окно сглаживания, секунды
 BASE_MBIT="${BASE_MBIT:-10}"            # базовый шум при idle, Mbit/s
+MAX_NOISE_MBIT="${MAX_NOISE_MBIT:-400}" # максимальная прибавка RX над TX, Mbit/s
 JITTER="${JITTER:-0.30}"                # рандом-разброс ±30% от целевой скорости
 VERBOSE="${VERBOSE:-0}"
 
@@ -95,7 +96,7 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s jitter=$JITTER"
+echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s max_noise=${MAX_NOISE_MBIT}Mbit/s jitter=$JITTER"
 
 NEXT_ID=0
 for ((i=0; i<MIN_WORKERS; i++)); do
@@ -111,6 +112,7 @@ done
 DEBT=0
 TARGET_RATE_BPS=$(awk -v m="$BASE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')   # старт = базовый шум
 EMA_ALPHA="0.05"   # коэффициент сглаживания TARGET_RATE (медленный)
+MAX_NOISE_BPS=$(awk -v m="$MAX_NOISE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')   # потолок прибавки
 
 TX_PREV=$(<"$TX_FILE")
 RX_PREV=$(<"$RX_FILE")
@@ -144,17 +146,28 @@ while true; do
   TX_RATE=$(awk -v d="$TX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
   RX_RATE=$(awk -v d="$RX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
 
-  # 1) Растим долг от свежего TX
-  ADD_DEBT=$(awk -v tx="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", tx*r}')
+  # 1) Растим долг от свежего TX, но не больше чем (TX + MAX_NOISE) * dt.
+  #    То есть прибавка RX над TX за тик ограничена MAX_NOISE_BPS.
+  RAW_ADD=$(awk -v tx="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", tx*r}')
+  CAP_ADD=$(awk -v tx="$TX_DELTA" -v cap="$MAX_NOISE_BPS" -v dt="$DT" \
+    'BEGIN{printf "%.0f", tx + cap*dt}')
+  if (( RAW_ADD > CAP_ADD )); then
+    ADD_DEBT=$CAP_ADD
+  else
+    ADD_DEBT=$RAW_ADD
+  fi
   DEBT=$(( DEBT + ADD_DEBT ))
 
   # 2) Списываем то, что уже скачали за этот тик
   DEBT=$(( DEBT - RX_DELTA ))
   (( DEBT < 0 )) && DEBT=0
 
-  # 3) Желаемая скорость = долг / окно сглаживания + базовый шум
+  # 3) Желаемая скорость = долг / окно сглаживания + базовый шум,
+  #    но не больше чем TX_RATE + MAX_NOISE_BPS (страховка)
   WANT_BPS=$(awk -v d="$DEBT" -v w="$SMOOTH_WINDOW" -v b="$BASE_BPS" \
     'BEGIN{printf "%.0f", d/w + b}')
+  HARD_CAP=$(( TX_RATE + MAX_NOISE_BPS ))
+  (( WANT_BPS > HARD_CAP )) && WANT_BPS=$HARD_CAP
 
   # 4) EMA-сглаживание TARGET_RATE_BPS, чтобы не дергался
   TARGET_RATE_BPS=$(awk -v cur="$TARGET_RATE_BPS" -v want="$WANT_BPS" -v a="$EMA_ALPHA" \
