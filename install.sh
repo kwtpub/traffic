@@ -14,6 +14,13 @@ LOG_PATH="/var/log/traffic_noise.log"
 LOGROTATE_PATH="/etc/logrotate.d/traffic-noise"
 SERVICE_NAME="traffic-noise"
 
+RAM_SCRIPT_PATH="/usr/local/bin/ram_noise.sh"
+RAM_SERVICE_PATH="/etc/systemd/system/ram-noise.service"
+RAM_ENV_PATH="/etc/default/ram-noise"
+RAM_LOG_PATH="/var/log/ram_noise.log"
+RAM_LOGROTATE_PATH="/etc/logrotate.d/ram-noise"
+RAM_SERVICE_NAME="ram-noise"
+
 if [[ $EUID -ne 0 ]]; then
   echo "Ошибка: запускай через sudo или от root." >&2
   exit 1
@@ -24,13 +31,13 @@ if ! command -v systemctl >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "[1/6] Устанавливаю зависимости..."
+echo "[1/9] Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq curl ca-certificates gawk iproute2 procps vnstat logrotate >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true
 
-echo "[2/6] Записываю traffic_noise.sh в $SCRIPT_PATH..."
+echo "[2/9] Записываю traffic_noise.sh в $SCRIPT_PATH..."
 cat > "$SCRIPT_PATH" <<'NOISE_EOF'
 #!/bin/bash
 # Адаптивный шум с развязкой формы графика.
@@ -250,7 +257,7 @@ done
 NOISE_EOF
 chmod +x "$SCRIPT_PATH"
 
-echo "[3/6] Создаю systemd unit $SERVICE_PATH..."
+echo "[3/9] Создаю systemd unit $SERVICE_PATH..."
 cat > "$SERVICE_PATH" <<UNIT_EOF
 [Unit]
 Description=Adaptive Traffic Noise (smoothed, decoupled from TX shape)
@@ -288,7 +295,7 @@ if [[ ! -f "$ENV_PATH" ]]; then
 ENV_EOF
 fi
 
-echo "[4/6] Создаю logrotate-конфиг $LOGROTATE_PATH..."
+echo "[4/9] Создаю logrotate-конфиг $LOGROTATE_PATH..."
 cat > "$LOGROTATE_PATH" <<LR_EOF
 $LOG_PATH {
     daily
@@ -306,20 +313,185 @@ chmod 644 "$LOGROTATE_PATH"
 touch "$LOG_PATH"
 chmod 644 "$LOG_PATH"
 
-echo "[5/6] Перезагружаю systemd, включаю автозапуск..."
+echo "[5/9] Записываю ram_noise.sh в $RAM_SCRIPT_PATH..."
+cat > "$RAM_SCRIPT_PATH" <<'RAM_EOF'
+#!/bin/bash
+# ram_noise.sh — заполняет RAM случайным образом (имитация работы сервера).
+# Цель колеблется в MIN_PCT..MAX_PCT, жесткий потолок SAFETY_PCT (default 85%).
+
+set -u
+
+MIN_PCT="${MIN_PCT:-30}"
+MAX_PCT="${MAX_PCT:-70}"
+SAFETY_PCT="${SAFETY_PCT:-85}"
+STEP_MB="${STEP_MB:-50}"
+TICK="${TICK:-3}"
+RETARGET_MIN="${RETARGET_MIN:-30}"
+RETARGET_MAX="${RETARGET_MAX:-120}"
+VERBOSE="${VERBOSE:-0}"
+
+TMPFS_DIR="/run/ram_noise.$$"
+BALLAST="$TMPFS_DIR/ballast"
+
+mkdir -p "$TMPFS_DIR"
+mount -t tmpfs -o size=95% tmpfs "$TMPFS_DIR" 2>/dev/null || {
+  echo "Не могу примонтировать tmpfs в $TMPFS_DIR" >&2
+  exit 1
+}
+
+cleanup() {
+  rm -f "$BALLAST" 2>/dev/null
+  umount "$TMPFS_DIR" 2>/dev/null
+  rmdir "$TMPFS_DIR" 2>/dev/null
+  exit 0
+}
+trap cleanup SIGINT SIGTERM EXIT
+
+mem_total_mb() { awk '/^MemTotal:/ {printf "%d", $2/1024}' /proc/meminfo; }
+mem_available_mb() { awk '/^MemAvailable:/ {printf "%d", $2/1024}' /proc/meminfo; }
+mem_used_pct() { awk '/^MemTotal:/ {t=$2} /^MemAvailable:/ {a=$2} END{printf "%.0f", (t-a)*100/t}' /proc/meminfo; }
+
+ballast_mb() {
+  if [[ -f "$BALLAST" ]]; then
+    stat -c '%s' "$BALLAST" | awk '{printf "%d", $1/1048576}'
+  else
+    echo 0
+  fi
+}
+
+TOTAL_MB=$(mem_total_mb)
+SAFETY_MB=$(( TOTAL_MB * SAFETY_PCT / 100 ))
+
+echo "Старт. total=${TOTAL_MB}MB safety=${SAFETY_PCT}% (${SAFETY_MB}MB) range=${MIN_PCT}..${MAX_PCT}%"
+
+pick_target() {
+  local span=$(( MAX_PCT - MIN_PCT ))
+  local pct=$(( MIN_PCT + RANDOM % (span + 1) ))
+  echo $(( TOTAL_MB * pct / 100 ))
+}
+
+TARGET_MB=$(pick_target)
+NEXT_RETARGET=$(( $(date +%s) + RETARGET_MIN + RANDOM % (RETARGET_MAX - RETARGET_MIN + 1) ))
+LAST_LOG=$(date +%s)
+
+while true; do
+  NOW=$(date +%s)
+
+  if (( NOW >= NEXT_RETARGET )); then
+    TARGET_MB=$(pick_target)
+    NEXT_RETARGET=$(( NOW + RETARGET_MIN + RANDOM % (RETARGET_MAX - RETARGET_MIN + 1) ))
+    [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] новая цель: ${TARGET_MB}MB"
+  fi
+
+  CUR=$(ballast_mb)
+  USED_PCT=$(mem_used_pct)
+  AVAIL_MB=$(mem_available_mb)
+
+  if (( USED_PCT > SAFETY_PCT )); then
+    NEW=$(( CUR - STEP_MB * 2 ))
+    (( NEW < 0 )) && NEW=0
+    truncate -s "${NEW}M" "$BALLAST" 2>/dev/null || :
+    [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] OVER_SAFETY ${USED_PCT}% — урезал до ${NEW}MB"
+  elif (( CUR < TARGET_MB )); then
+    HEADROOM_MB=$(( SAFETY_MB - (TOTAL_MB - AVAIL_MB) ))
+    if (( HEADROOM_MB > STEP_MB * 2 )); then
+      ADD=$STEP_MB
+      (( CUR + ADD > TARGET_MB )) && ADD=$(( TARGET_MB - CUR ))
+      NEW=$(( CUR + ADD ))
+      dd if=/dev/urandom of="$BALLAST" bs=1M count="$ADD" \
+         oflag=append conv=notrunc seek="$CUR" status=none 2>/dev/null || :
+      truncate -s "${NEW}M" "$BALLAST" 2>/dev/null || :
+    fi
+  elif (( CUR > TARGET_MB + STEP_MB )); then
+    NEW=$(( CUR - STEP_MB ))
+    (( NEW < TARGET_MB )) && NEW=$TARGET_MB
+    truncate -s "${NEW}M" "$BALLAST" 2>/dev/null || :
+  fi
+
+  if [[ "$VERBOSE" != "1" ]] && (( NOW - LAST_LOG >= 60 )); then
+    BAL=$(ballast_mb)
+    echo "[$(date '+%F %H:%M:%S')] ballast=${BAL}MB target=${TARGET_MB}MB total_used=${USED_PCT}% avail=${AVAIL_MB}MB"
+    LAST_LOG=$NOW
+  elif [[ "$VERBOSE" == "1" ]]; then
+    BAL=$(ballast_mb)
+    echo "[$(date '+%H:%M:%S')] ballast=${BAL}MB → ${TARGET_MB}MB used=${USED_PCT}% avail=${AVAIL_MB}MB"
+  fi
+
+  sleep "$TICK"
+done
+RAM_EOF
+chmod +x "$RAM_SCRIPT_PATH"
+
+echo "[6/9] Создаю systemd unit $RAM_SERVICE_PATH..."
+cat > "$RAM_SERVICE_PATH" <<RAM_UNIT_EOF
+[Unit]
+Description=RAM Noise (random ballast in tmpfs to mimic loaded server)
+After=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=-$RAM_ENV_PATH
+ExecStart=$RAM_SCRIPT_PATH
+Restart=always
+RestartSec=10
+User=root
+StandardOutput=append:$RAM_LOG_PATH
+StandardError=append:$RAM_LOG_PATH
+
+[Install]
+WantedBy=multi-user.target
+RAM_UNIT_EOF
+
+if [[ ! -f "$RAM_ENV_PATH" ]]; then
+  cat > "$RAM_ENV_PATH" <<RAM_ENV_EOF
+# Конфигурация ram-noise (опционально). После правки: systemctl restart $RAM_SERVICE_NAME
+#MIN_PCT=30          # минимальная цель, % от total RAM
+#MAX_PCT=70          # максимальная цель
+#SAFETY_PCT=85       # жесткий потолок: общая загрузка не превысит этот процент
+#STEP_MB=50          # шаг изменения, МБ
+#TICK=3              # частота проверки, сек
+#RETARGET_MIN=30     # минимум секунд между сменами цели
+#RETARGET_MAX=120    # максимум секунд между сменами цели
+#VERBOSE=0
+RAM_ENV_EOF
+fi
+
+cat > "$RAM_LOGROTATE_PATH" <<RAM_LR_EOF
+$RAM_LOG_PATH {
+    daily
+    rotate 7
+    maxsize 50M
+    missingok
+    notifempty
+    compress
+    delaycompress
+    copytruncate
+}
+RAM_LR_EOF
+chmod 644 "$RAM_LOGROTATE_PATH"
+
+touch "$RAM_LOG_PATH"
+chmod 644 "$RAM_LOG_PATH"
+
+echo "[7/9] Перезагружаю systemd, включаю автозапуск..."
 systemctl daemon-reload
 systemctl enable "$SERVICE_NAME" >/dev/null 2>&1
+systemctl enable "$RAM_SERVICE_NAME" >/dev/null 2>&1
 
-echo "[6/6] Запускаю сервис..."
+echo "[8/9] Запускаю traffic-noise..."
 systemctl restart "$SERVICE_NAME"
+
+echo "[9/9] Запускаю ram-noise..."
+systemctl restart "$RAM_SERVICE_NAME"
 
 sleep 1
 systemctl status "$SERVICE_NAME" --no-pager -l || true
+echo
+systemctl status "$RAM_SERVICE_NAME" --no-pager -l || true
 
 echo
 echo "Готово."
-echo "Логи:     tail -f $LOG_PATH                  (тихий режим: 1 строка/мин)"
-echo "Подробно: VERBOSE=1 в $ENV_PATH              (1 строка/2 сек)"
-echo "Журнал:   journalctl -u $SERVICE_NAME -f"
-echo "Трафик:   vnstat -h                          (по часам, проверить RX:TX)"
-echo "Стоп:     systemctl stop $SERVICE_NAME"
+echo "Трафик: tail -f $LOG_PATH"
+echo "RAM:    tail -f $RAM_LOG_PATH"
+echo "Стоп:   systemctl stop $SERVICE_NAME $RAM_SERVICE_NAME"
+echo "Free:   free -h     (увидишь занятую память в used/buff/cache)"
