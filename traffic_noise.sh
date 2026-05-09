@@ -1,15 +1,20 @@
 #!/bin/bash
-# traffic_noise.sh — непрерывный адаптивный шум через пул параллельных curl.
-# Регулирует число параллельных скачиваний так, чтобы RX_rate = RATIO * TX_rate.
+# traffic_noise.sh — адаптивный шум с развязкой формы графика.
+# Накапливает "долг" RX = RATIO * (TX_total - стартовый), а тратит долг
+# плавно через скользящее окно SMOOTH_WINDOW секунд + базовый шум BASE_MBIT.
+# В результате график RX визуально не коррелирует с графиком TX.
 
 set -u
 
 RATIO="${RATIO:-2.5}"
 IFACE="${IFACE:-$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
-MIN_WORKERS="${MIN_WORKERS:-0}"
+MIN_WORKERS="${MIN_WORKERS:-1}"
 MAX_WORKERS="${MAX_WORKERS:-32}"
 CHUNK_MB="${CHUNK_MB:-200}"
-VERBOSE="${VERBOSE:-0}"        # 1 = строка каждые 2 сек, 0 = сводка раз в 60 сек
+SMOOTH_WINDOW="${SMOOTH_WINDOW:-300}"   # окно сглаживания, секунды
+BASE_MBIT="${BASE_MBIT:-10}"            # базовый шум при idle, Mbit/s
+JITTER="${JITTER:-0.30}"                # рандом-разброс ±30% от целевой скорости
+VERBOSE="${VERBOSE:-0}"
 
 FILES=(
   "https://speed.hetzner.de/10GB.bin"
@@ -65,13 +70,15 @@ spawn_worker() {
   echo $! > "$pidfile"
 }
 
-kill_worker() {
-  local pidfile=$1
-  [[ -f "$pidfile" ]] || return
-  local pid=$(<"$pidfile")
-  kill "$pid" 2>/dev/null || true
-  pkill -P "$pid" 2>/dev/null || true
-  rm -f "$pidfile"
+kill_one_worker() {
+  for pidfile in "$WORKER_DIR"/*.pid; do
+    [[ -f "$pidfile" ]] || continue
+    local pid=$(<"$pidfile")
+    kill "$pid" 2>/dev/null || true
+    pkill -P "$pid" 2>/dev/null || true
+    rm -f "$pidfile"
+    return 0
+  done
 }
 
 count_workers() {
@@ -88,21 +95,31 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. Интерфейс=$IFACE RATIO=$RATIO MIN=$MIN_WORKERS MAX=$MAX_WORKERS CHUNK=${CHUNK_MB}MB VERBOSE=$VERBOSE"
+echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s jitter=$JITTER"
 
 NEXT_ID=0
 for ((i=0; i<MIN_WORKERS; i++)); do
-  spawn_worker "$NEXT_ID"
-  NEXT_ID=$((NEXT_ID+1))
+  spawn_worker "$NEXT_ID"; NEXT_ID=$((NEXT_ID+1))
 done
+
+# === Состояние интегратора ===
+# DEBT — сколько байт мы "должны" скачать сверх уже скачанного
+# DEBT растет на (TX_delta * RATIO) каждый тик
+# DEBT тратится на target_rate * dt каждый тик
+# target_rate движется к (DEBT / SMOOTH_WINDOW) с экспоненциальным сглаживанием
+
+DEBT=0
+TARGET_RATE_BPS=$(awk -v m="$BASE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')   # старт = базовый шум
+EMA_ALPHA="0.05"   # коэффициент сглаживания TARGET_RATE (медленный)
 
 TX_PREV=$(<"$TX_FILE")
 RX_PREV=$(<"$RX_FILE")
 T_PREV=$(date +%s.%N)
 
-# Агрегаты для краткой сводки (используются при VERBOSE=0)
-SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; SUM_DEBT=0; TICKS=0
 LAST_SUMMARY=$(date +%s)
+
+BASE_BPS=$(awk -v m="$BASE_MBIT" 'BEGIN{printf "%.0f", m*1000000/8}')
 
 while true; do
   sleep 2
@@ -111,7 +128,7 @@ while true; do
   RX_NOW=$(<"$RX_FILE")
   T_NOW=$(date +%s.%N)
 
-  read TX_RATE RX_RATE < <(awk \
+  read DT TX_DELTA RX_DELTA < <(awk \
     -v ta="$TX_PREV" -v tb="$TX_NOW" \
     -v ra="$RX_PREV" -v rb="$RX_NOW" \
     -v t1="$T_PREV"  -v t2="$T_NOW"  \
@@ -119,41 +136,64 @@ while true; do
        dt=t2-t1; if(dt<=0) dt=1;
        dtx=tb-ta; if(dtx<0) dtx=0;
        drx=rb-ra; if(drx<0) drx=0;
-       printf "%.0f %.0f", dtx/dt, drx/dt;
+       printf "%.3f %.0f %.0f", dt, dtx, drx;
      }')
 
   TX_PREV="$TX_NOW"; RX_PREV="$RX_NOW"; T_PREV="$T_NOW"
 
-  TARGET_RX=$(awk -v r="$TX_RATE" -v k="$RATIO" 'BEGIN{printf "%.0f", r*k}')
-  N=$(count_workers)
+  TX_RATE=$(awk -v d="$TX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
+  RX_RATE=$(awk -v d="$RX_DELTA" -v t="$DT" 'BEGIN{printf "%.0f", d/t}')
 
-  LOW=$(awk -v t="$TARGET_RX"  'BEGIN{printf "%.0f", t*0.90}')
-  HIGH=$(awk -v t="$TARGET_RX" 'BEGIN{printf "%.0f", t*1.10}')
+  # 1) Растим долг от свежего TX
+  ADD_DEBT=$(awk -v tx="$TX_DELTA" -v r="$RATIO" 'BEGIN{printf "%.0f", tx*r}')
+  DEBT=$(( DEBT + ADD_DEBT ))
+
+  # 2) Списываем то, что уже скачали за этот тик
+  DEBT=$(( DEBT - RX_DELTA ))
+  (( DEBT < 0 )) && DEBT=0
+
+  # 3) Желаемая скорость = долг / окно сглаживания + базовый шум
+  WANT_BPS=$(awk -v d="$DEBT" -v w="$SMOOTH_WINDOW" -v b="$BASE_BPS" \
+    'BEGIN{printf "%.0f", d/w + b}')
+
+  # 4) EMA-сглаживание TARGET_RATE_BPS, чтобы не дергался
+  TARGET_RATE_BPS=$(awk -v cur="$TARGET_RATE_BPS" -v want="$WANT_BPS" -v a="$EMA_ALPHA" \
+    'BEGIN{printf "%.0f", cur + a*(want-cur)}')
+
+  # 5) Добавляем jitter ±JITTER, чтобы график выглядел как органический шум
+  JITTER_RATE=$(awk -v r="$TARGET_RATE_BPS" -v j="$JITTER" -v rnd="$RANDOM" \
+    'BEGIN{
+       srand(rnd);
+       k = 1 + j*(2*rand()-1);   # коэффициент в диапазоне [1-j, 1+j]
+       printf "%.0f", r*k;
+     }')
+
+  # 6) Регулируем число воркеров под JITTER_RATE
+  N=$(count_workers)
+  LOW=$(awk  -v t="$JITTER_RATE" 'BEGIN{printf "%.0f", t*0.85}')
+  HIGH=$(awk -v t="$JITTER_RATE" 'BEGIN{printf "%.0f", t*1.15}')
 
   ACTION=""
   if (( RX_RATE < LOW )) && (( N < MAX_WORKERS )); then
-    spawn_worker "$NEXT_ID"
-    NEXT_ID=$((NEXT_ID+1))
+    spawn_worker "$NEXT_ID"; NEXT_ID=$((NEXT_ID+1))
     ACTION="+1"
   elif (( RX_RATE > HIGH )) && (( N > MIN_WORKERS )); then
-    for pidfile in "$WORKER_DIR"/*.pid; do
-      [[ -f "$pidfile" ]] || continue
-      kill_worker "$pidfile"
-      ACTION="-1"
-      break
-    done
+    kill_one_worker
+    ACTION="-1"
   fi
 
   if [[ "$VERBOSE" == "1" ]]; then
-    TX_MBIT=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-    RX_MBIT=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
-    TGT_MBIT=$(awk -v r="$TARGET_RX" 'BEGIN{printf "%.1f", r*8/1000000}')
-    echo "[$(date '+%H:%M:%S')] TX=${TX_MBIT}Mbit/s RX=${RX_MBIT}Mbit/s (target=${TGT_MBIT}) workers=$N ${ACTION}"
+    TX_M=$(awk -v r="$TX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    RX_M=$(awk -v r="$RX_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    TGT_M=$(awk -v r="$JITTER_RATE" 'BEGIN{printf "%.1f", r*8/1000000}')
+    DEBT_MB=$(awk -v d="$DEBT" 'BEGIN{printf "%.1f", d/1048576}')
+    echo "[$(date '+%H:%M:%S')] TX=${TX_M} RX=${RX_M} target=${TGT_M} Mbit/s debt=${DEBT_MB}MB workers=$N $ACTION"
   else
     SUM_TX=$(( SUM_TX + TX_RATE ))
     SUM_RX=$(( SUM_RX + RX_RATE ))
-    SUM_TGT=$(( SUM_TGT + TARGET_RX ))
+    SUM_TGT=$(( SUM_TGT + JITTER_RATE ))
     SUM_N=$(( SUM_N + N ))
+    SUM_DEBT=$(( SUM_DEBT + DEBT ))
     TICKS=$(( TICKS + 1 ))
 
     NOW=$(date +%s)
@@ -161,16 +201,18 @@ while true; do
       AVG_TX=$(( SUM_TX / TICKS ))
       AVG_RX=$(( SUM_RX / TICKS ))
       AVG_TGT=$(( SUM_TGT / TICKS ))
+      AVG_DEBT=$(( SUM_DEBT / TICKS ))
       AVG_N=$(awk -v s="$SUM_N" -v t="$TICKS" 'BEGIN{printf "%.1f", s/t}')
 
-      TX_MBIT=$(awk -v r="$AVG_TX"  'BEGIN{printf "%.1f", r*8/1000000}')
-      RX_MBIT=$(awk -v r="$AVG_RX"  'BEGIN{printf "%.1f", r*8/1000000}')
-      TGT_MBIT=$(awk -v r="$AVG_TGT" 'BEGIN{printf "%.1f", r*8/1000000}')
+      TX_M=$(awk -v r="$AVG_TX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      RX_M=$(awk -v r="$AVG_RX"  'BEGIN{printf "%.1f", r*8/1000000}')
+      TGT_M=$(awk -v r="$AVG_TGT" 'BEGIN{printf "%.1f", r*8/1000000}')
+      DEBT_MB=$(awk -v d="$AVG_DEBT" 'BEGIN{printf "%.1f", d/1048576}')
       RATIO_NOW=$(awk -v t="$AVG_TX" -v r="$AVG_RX" 'BEGIN{if(t<1) t=1; printf "%.2f", r/t}')
 
-      echo "[$(date '+%F %H:%M:%S')] avg/min: TX=${TX_MBIT} RX=${RX_MBIT} target=${TGT_MBIT} Mbit/s | ratio=${RATIO_NOW} | workers~${AVG_N}"
+      echo "[$(date '+%F %H:%M:%S')] avg/min: TX=${TX_M} RX=${RX_M} target=${TGT_M} Mbit/s | ratio=${RATIO_NOW} | debt=${DEBT_MB}MB workers~${AVG_N}"
 
-      SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; TICKS=0
+      SUM_TX=0; SUM_RX=0; SUM_TGT=0; SUM_N=0; SUM_DEBT=0; TICKS=0
       LAST_SUMMARY=$NOW
     fi
   fi
