@@ -316,13 +316,17 @@ chmod 644 "$LOG_PATH"
 echo "[5/9] Записываю ram_noise.sh в $RAM_SCRIPT_PATH..."
 cat > "$RAM_SCRIPT_PATH" <<'RAM_EOF'
 #!/bin/bash
-# ram_noise.sh — заполняет RAM случайным образом (имитация работы сервера).
-# Цель колеблется в MIN_PCT..MAX_PCT, жесткий потолок SAFETY_PCT (default 85%).
+# ram_noise.sh — RAM-балласт с базовой целью ~20% и периодическими спайками.
 
 set -u
 
-MIN_PCT="${MIN_PCT:-30}"
-MAX_PCT="${MAX_PCT:-70}"
+BASE_MIN_PCT="${BASE_MIN_PCT:-15}"
+BASE_MAX_PCT="${BASE_MAX_PCT:-25}"
+SPIKE_MIN_PCT="${SPIKE_MIN_PCT:-35}"
+SPIKE_MAX_PCT="${SPIKE_MAX_PCT:-55}"
+SPIKE_CHANCE_PCT="${SPIKE_CHANCE_PCT:-15}"
+SPIKE_DURATION_MIN="${SPIKE_DURATION_MIN:-20}"
+SPIKE_DURATION_MAX="${SPIKE_DURATION_MAX:-60}"
 SAFETY_PCT="${SAFETY_PCT:-85}"
 STEP_MB="${STEP_MB:-50}"
 TICK="${TICK:-3}"
@@ -362,25 +366,48 @@ ballast_mb() {
 TOTAL_MB=$(mem_total_mb)
 SAFETY_MB=$(( TOTAL_MB * SAFETY_PCT / 100 ))
 
-echo "Старт. total=${TOTAL_MB}MB safety=${SAFETY_PCT}% (${SAFETY_MB}MB) range=${MIN_PCT}..${MAX_PCT}%"
+echo "Старт. total=${TOTAL_MB}MB safety=${SAFETY_PCT}% (${SAFETY_MB}MB) base=${BASE_MIN_PCT}..${BASE_MAX_PCT}% spike=${SPIKE_MIN_PCT}..${SPIKE_MAX_PCT}% (${SPIKE_CHANCE_PCT}% chance)"
 
-pick_target() {
-  local span=$(( MAX_PCT - MIN_PCT ))
-  local pct=$(( MIN_PCT + RANDOM % (span + 1) ))
+pick_base_target() {
+  local span=$(( BASE_MAX_PCT - BASE_MIN_PCT ))
+  local pct=$(( BASE_MIN_PCT + RANDOM % (span + 1) ))
   echo $(( TOTAL_MB * pct / 100 ))
 }
 
-TARGET_MB=$(pick_target)
+pick_spike_target() {
+  local span=$(( SPIKE_MAX_PCT - SPIKE_MIN_PCT ))
+  local pct=$(( SPIKE_MIN_PCT + RANDOM % (span + 1) ))
+  echo $(( TOTAL_MB * pct / 100 ))
+}
+
+IS_SPIKE=0
+SPIKE_END=0
+TARGET_MB=$(pick_base_target)
 NEXT_RETARGET=$(( $(date +%s) + RETARGET_MIN + RANDOM % (RETARGET_MAX - RETARGET_MIN + 1) ))
 LAST_LOG=$(date +%s)
 
 while true; do
   NOW=$(date +%s)
 
-  if (( NOW >= NEXT_RETARGET )); then
-    TARGET_MB=$(pick_target)
+  if (( IS_SPIKE == 1 )) && (( NOW >= SPIKE_END )); then
+    IS_SPIKE=0
+    TARGET_MB=$(pick_base_target)
+    [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] spike конец, base=${TARGET_MB}MB"
     NEXT_RETARGET=$(( NOW + RETARGET_MIN + RANDOM % (RETARGET_MAX - RETARGET_MIN + 1) ))
-    [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] новая цель: ${TARGET_MB}MB"
+  fi
+
+  if (( IS_SPIKE == 0 )) && (( NOW >= NEXT_RETARGET )); then
+    if (( RANDOM % 100 < SPIKE_CHANCE_PCT )); then
+      IS_SPIKE=1
+      TARGET_MB=$(pick_spike_target)
+      SPIKE_DUR=$(( SPIKE_DURATION_MIN + RANDOM % (SPIKE_DURATION_MAX - SPIKE_DURATION_MIN + 1) ))
+      SPIKE_END=$(( NOW + SPIKE_DUR ))
+      [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] SPIKE на ${SPIKE_DUR}s до ${TARGET_MB}MB"
+    else
+      TARGET_MB=$(pick_base_target)
+      [[ "$VERBOSE" == "1" ]] && echo "[$(date '+%H:%M:%S')] base=${TARGET_MB}MB"
+    fi
+    NEXT_RETARGET=$(( NOW + RETARGET_MIN + RANDOM % (RETARGET_MAX - RETARGET_MIN + 1) ))
   fi
 
   CUR=$(ballast_mb)
@@ -408,13 +435,17 @@ while true; do
     truncate -s "${NEW}M" "$BALLAST" 2>/dev/null || :
   fi
 
+  STATE="base"
+  (( IS_SPIKE == 1 )) && STATE="SPIKE"
+
   if [[ "$VERBOSE" != "1" ]] && (( NOW - LAST_LOG >= 60 )); then
     BAL=$(ballast_mb)
-    echo "[$(date '+%F %H:%M:%S')] ballast=${BAL}MB target=${TARGET_MB}MB total_used=${USED_PCT}% avail=${AVAIL_MB}MB"
+    BAL_PCT=$(( BAL * 100 / TOTAL_MB ))
+    echo "[$(date '+%F %H:%M:%S')] ballast=${BAL}MB (${BAL_PCT}%) target=${TARGET_MB}MB state=${STATE} total_used=${USED_PCT}% avail=${AVAIL_MB}MB"
     LAST_LOG=$NOW
   elif [[ "$VERBOSE" == "1" ]]; then
     BAL=$(ballast_mb)
-    echo "[$(date '+%H:%M:%S')] ballast=${BAL}MB → ${TARGET_MB}MB used=${USED_PCT}% avail=${AVAIL_MB}MB"
+    echo "[$(date '+%H:%M:%S')] ${STATE} ballast=${BAL}MB → ${TARGET_MB}MB used=${USED_PCT}% avail=${AVAIL_MB}MB"
   fi
 
   sleep "$TICK"
@@ -445,13 +476,18 @@ RAM_UNIT_EOF
 if [[ ! -f "$RAM_ENV_PATH" ]]; then
   cat > "$RAM_ENV_PATH" <<RAM_ENV_EOF
 # Конфигурация ram-noise (опционально). После правки: systemctl restart $RAM_SERVICE_NAME
-#MIN_PCT=30          # минимальная цель, % от total RAM
-#MAX_PCT=70          # максимальная цель
-#SAFETY_PCT=85       # жесткий потолок: общая загрузка не превысит этот процент
-#STEP_MB=50          # шаг изменения, МБ
-#TICK=3              # частота проверки, сек
-#RETARGET_MIN=30     # минимум секунд между сменами цели
-#RETARGET_MAX=120    # максимум секунд между сменами цели
+#BASE_MIN_PCT=15        # базовая цель, нижняя граница (% от total RAM)
+#BASE_MAX_PCT=25        # базовая цель, верхняя граница
+#SPIKE_MIN_PCT=35       # спайк, нижняя граница
+#SPIKE_MAX_PCT=55       # спайк, верхняя граница
+#SPIKE_CHANCE_PCT=15    # вероятность спайка при ретаргете (%)
+#SPIKE_DURATION_MIN=20  # длительность спайка, мин (сек)
+#SPIKE_DURATION_MAX=60  # длительность спайка, макс (сек)
+#SAFETY_PCT=85          # жесткий потолок общей загрузки RAM
+#STEP_MB=50             # шаг изменения, МБ
+#TICK=3                 # частота проверки, сек
+#RETARGET_MIN=30        # минимум секунд между ретаргетами
+#RETARGET_MAX=120       # максимум секунд между ретаргетами
 #VERBOSE=0
 RAM_ENV_EOF
 fi
