@@ -34,7 +34,7 @@ fi
 echo "[1/9] Устанавливаю зависимости..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq curl ca-certificates gawk iproute2 procps vnstat logrotate >/dev/null
+apt-get install -y -qq curl ca-certificates gawk iproute2 procps vnstat logrotate ethtool >/dev/null
 systemctl enable --now vnstat >/dev/null 2>&1 || true
 
 echo "[2/9] Записываю traffic_noise.sh в $SCRIPT_PATH..."
@@ -59,16 +59,39 @@ JITTER="${JITTER:-0.30}"                # рандом-разброс ±30% от
 # Защита от перегрузки сервера:
 CPU_SOFT_PCT="${CPU_SOFT_PCT:-70}"      # выше этого CPU используем — начинаем душить шум
 CPU_HARD_PCT="${CPU_HARD_PCT:-90}"      # выше этого — шум = 0
-LINK_MBIT="${LINK_MBIT:-1000}"          # потолок канала, Mbit/s (для авто-душения)
+# LINK_MBIT определяется автоматически (см. detect_link_mbit ниже).
+# Можно переопределить вручную, задав LINK_MBIT в /etc/default/traffic-noise.
+LINK_MBIT="${LINK_MBIT:-auto}"
 LINK_SOFT_PCT="${LINK_SOFT_PCT:-70}"    # выше этого% от LINK_MBIT по TX+RX — душим
 LINK_HARD_PCT="${LINK_HARD_PCT:-90}"    # выше этого — шум = 0
 # Удобный способ задать потолок прибавки в процентах от канала.
 # Если задан — переопределяет MAX_NOISE_MBIT (например, MAX_NOISE_PCT=30 при LINK_MBIT=1000 → 300 Mbit/s).
 MAX_NOISE_PCT="${MAX_NOISE_PCT:-}"
-if [[ -n "$MAX_NOISE_PCT" ]]; then
-  MAX_NOISE_MBIT=$(( LINK_MBIT * MAX_NOISE_PCT / 100 ))
-fi
 VERBOSE="${VERBOSE:-0}"
+
+# Автоопределение скорости канала.
+# 1) /sys/class/net/<iface>/speed — самое простое, отдает Mbit/s или -1.
+# 2) ethtool <iface> | grep Speed: — fallback (требует ethtool).
+# 3) Если ничего не вышло — 1000 Mbit/s (разумный дефолт для VPS).
+detect_link_mbit() {
+  local iface="$1"
+  local speed
+  if [[ -r "/sys/class/net/$iface/speed" ]]; then
+    speed=$(<"/sys/class/net/$iface/speed")
+    if [[ "$speed" =~ ^[0-9]+$ ]] && (( speed > 0 )); then
+      echo "$speed"
+      return
+    fi
+  fi
+  if command -v ethtool >/dev/null 2>&1; then
+    speed=$(ethtool "$iface" 2>/dev/null | awk -F: '/Speed:/ {gsub(/[^0-9]/,"",$2); print $2}')
+    if [[ -n "$speed" ]] && (( speed > 0 )); then
+      echo "$speed"
+      return
+    fi
+  fi
+  echo 1000
+}
 
 FILES=(
   "https://speed.hetzner.de/10GB.bin"
@@ -91,6 +114,18 @@ fi
 TX_FILE="/sys/class/net/$IFACE/statistics/tx_bytes"
 RX_FILE="/sys/class/net/$IFACE/statistics/rx_bytes"
 [[ -r "$TX_FILE" && -r "$RX_FILE" ]] || { echo "Нет доступа к $TX_FILE/$RX_FILE" >&2; exit 1; }
+
+# Автоопределение канала, если не задано вручную.
+LINK_SOURCE="manual"
+if [[ "$LINK_MBIT" == "auto" ]]; then
+  LINK_MBIT=$(detect_link_mbit "$IFACE")
+  LINK_SOURCE="auto"
+fi
+
+# Пересчет MAX_NOISE_MBIT, если задан процент от канала.
+if [[ -n "$MAX_NOISE_PCT" ]]; then
+  MAX_NOISE_MBIT=$(( LINK_MBIT * MAX_NOISE_PCT / 100 ))
+fi
 
 WORKER_DIR="/run/traffic_noise.$$"
 mkdir -p "$WORKER_DIR"
@@ -149,7 +184,7 @@ count_workers() {
   echo "$n"
 }
 
-echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s max_noise=${MAX_NOISE_MBIT}Mbit/s jitter=$JITTER cpu=${CPU_SOFT_PCT}/${CPU_HARD_PCT}% link=${LINK_MBIT}Mbit/s ${LINK_SOFT_PCT}/${LINK_HARD_PCT}%"
+echo "Старт. iface=$IFACE ratio=$RATIO smooth=${SMOOTH_WINDOW}s base=${BASE_MBIT}Mbit/s max_noise=${MAX_NOISE_MBIT}Mbit/s jitter=$JITTER cpu=${CPU_SOFT_PCT}/${CPU_HARD_PCT}% link=${LINK_MBIT}Mbit/s (${LINK_SOURCE}) ${LINK_SOFT_PCT}/${LINK_HARD_PCT}%"
 
 # Чтение CPU из /proc/stat: возвращает % использования (1 - idle/total) за интервал.
 CPU_PREV_TOTAL=0
@@ -380,6 +415,8 @@ if [[ ! -f "$ENV_PATH" ]]; then
 #BASE_MBIT=10            # базовый шум при idle, Mbit/s
 #MAX_NOISE_MBIT=400      # потолок прибавки RX над TX (RX <= TX + MAX_NOISE_MBIT)
 #MAX_NOISE_PCT=30        # ИЛИ задать потолок в % от LINK_MBIT (переопределяет MAX_NOISE_MBIT)
+                         # При auto-канале это самый удобный вариант
+#LINK_MBIT=auto          # auto = определить через /sys/.../speed и ethtool; можно задать число
 #JITTER=0.30             # рандом-разброс ±30%
 #CPU_SOFT_PCT=70         # выше этого CPU% — плавно душим шум (множитель < 1)
 #CPU_HARD_PCT=90         # выше этого CPU% — шум полностью отключен
