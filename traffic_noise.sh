@@ -21,6 +21,12 @@ CPU_HARD_PCT="${CPU_HARD_PCT:-90}"      # выше этого — шум = 0
 LINK_MBIT="${LINK_MBIT:-1000}"          # потолок канала, Mbit/s (для авто-душения)
 LINK_SOFT_PCT="${LINK_SOFT_PCT:-70}"    # выше этого% от LINK_MBIT по TX+RX — душим
 LINK_HARD_PCT="${LINK_HARD_PCT:-90}"    # выше этого — шум = 0
+# Удобный способ задать потолок прибавки в процентах от канала.
+# Если задан — переопределяет MAX_NOISE_MBIT (например, MAX_NOISE_PCT=30 при LINK_MBIT=1000 → 300 Mbit/s).
+MAX_NOISE_PCT="${MAX_NOISE_PCT:-}"
+if [[ -n "$MAX_NOISE_PCT" ]]; then
+  MAX_NOISE_MBIT=$(( LINK_MBIT * MAX_NOISE_PCT / 100 ))
+fi
 VERBOSE="${VERBOSE:-0}"
 
 FILES=(

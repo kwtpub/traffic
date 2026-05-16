@@ -39,6 +39,7 @@ systemctl enable --now vnstat >/dev/null 2>&1 || true
 
 echo "[2/9] Записываю traffic_noise.sh в $SCRIPT_PATH..."
 cat > "$SCRIPT_PATH" <<'NOISE_EOF'
+#!/bin/bash
 # traffic_noise.sh — адаптивный шум с развязкой формы графика.
 # Накапливает "долг" RX = RATIO * (TX_total - стартовый), а тратит долг
 # плавно через скользящее окно SMOOTH_WINDOW секунд + базовый шум BASE_MBIT.
@@ -61,6 +62,12 @@ CPU_HARD_PCT="${CPU_HARD_PCT:-90}"      # выше этого — шум = 0
 LINK_MBIT="${LINK_MBIT:-1000}"          # потолок канала, Mbit/s (для авто-душения)
 LINK_SOFT_PCT="${LINK_SOFT_PCT:-70}"    # выше этого% от LINK_MBIT по TX+RX — душим
 LINK_HARD_PCT="${LINK_HARD_PCT:-90}"    # выше этого — шум = 0
+# Удобный способ задать потолок прибавки в процентах от канала.
+# Если задан — переопределяет MAX_NOISE_MBIT (например, MAX_NOISE_PCT=30 при LINK_MBIT=1000 → 300 Mbit/s).
+MAX_NOISE_PCT="${MAX_NOISE_PCT:-}"
+if [[ -n "$MAX_NOISE_PCT" ]]; then
+  MAX_NOISE_MBIT=$(( LINK_MBIT * MAX_NOISE_PCT / 100 ))
+fi
 VERBOSE="${VERBOSE:-0}"
 
 FILES=(
@@ -372,6 +379,7 @@ if [[ ! -f "$ENV_PATH" ]]; then
 #SMOOTH_WINDOW=300       # окно сглаживания, сек (300 = долг гасится за 5 минут)
 #BASE_MBIT=10            # базовый шум при idle, Mbit/s
 #MAX_NOISE_MBIT=400      # потолок прибавки RX над TX (RX <= TX + MAX_NOISE_MBIT)
+#MAX_NOISE_PCT=30        # ИЛИ задать потолок в % от LINK_MBIT (переопределяет MAX_NOISE_MBIT)
 #JITTER=0.30             # рандом-разброс ±30%
 #CPU_SOFT_PCT=70         # выше этого CPU% — плавно душим шум (множитель < 1)
 #CPU_HARD_PCT=90         # выше этого CPU% — шум полностью отключен
